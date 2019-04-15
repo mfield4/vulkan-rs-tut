@@ -1,0 +1,13 @@
+[package]
+name = "hello_triangle"
+version = "0.1.0"
+authors = ["Michael Field <michaecfield97@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+vulkano = "0.11.1"
+
+[dependencies.sdl2]
+version = "0.32"
+default-features = false
+features = ["ttf","image","gfx","mixer"]
