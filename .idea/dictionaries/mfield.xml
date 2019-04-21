@@ -1,6 +1,7 @@
 <component name="ProjectDictionaryState">
   <dictionary name="mfield">
     <words>
+      <w>framebuffers</w>
       <w>vulkan</w>
       <w>vulkano</w>
       <w>winit</w>
