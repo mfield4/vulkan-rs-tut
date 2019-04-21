@@ -1,39 +1,31 @@
-extern crate sdl2;
 #[macro_use]
 extern crate vulkano;
+extern crate vulkano_shaders;
 extern crate vulkano_win;
+extern crate winit;
 
 use std::{collections::HashSet, iter::FromIterator, sync::Arc};
 
-use sdl2::{
-    event::Event,
-    keyboard::Keycode,
-    video::{Window, WindowBuilder, WindowContext},
+use vulkano::command_buffer::{AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState};
+use vulkano::descriptor::PipelineLayoutAbstract;
+use vulkano::device::{Device, DeviceExtensions, Features, Queue};
+use vulkano::format::Format;
+use vulkano::framebuffer::{Framebuffer, FramebufferAbstract, RenderPassAbstract, Subpass};
+use vulkano::image::{swapchain::SwapchainImage, ImageUsage};
+use vulkano::instance::debug::{DebugCallback, MessageTypes};
+use vulkano::instance::{
+    layers_list, ApplicationInfo, Instance, InstanceExtensions, PhysicalDevice, Version,
 };
-use vulkano::{
-    command_buffer::{AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState},
-    descriptor::PipelineLayoutAbstract,
-    device::{Device, DeviceExtensions, Features, Queue},
-    format::Format,
-    framebuffer::{Framebuffer, FramebufferAbstract, RenderPassAbstract, Subpass},
-    image::{swapchain::SwapchainImage, ImageUsage},
-    instance::{
-        debug::{DebugCallback, MessageTypes},
-        layers_list, ApplicationInfo, Instance, InstanceExtensions, PhysicalDevice, Version,
-    },
-    pipeline::{
-        vertex::{BufferlessDefinition, BufferlessVertices},
-        viewport::Viewport,
-        GraphicsPipeline,
-    },
-    swapchain::{
-        acquire_next_image, Capabilities, ColorSpace, CompositeAlpha, PresentMode,
-        SupportedPresentModes, Surface, Swapchain,
-    },
-    sync::{GpuFuture, SharingMode},
-    VulkanObject,
+use vulkano::pipeline::{
+    vertex::BufferlessDefinition, vertex::BufferlessVertices, viewport::Viewport, GraphicsPipeline,
 };
+use vulkano::swapchain::{
+    acquire_next_image, Capabilities, ColorSpace, CompositeAlpha, PresentMode,
+    SupportedPresentModes, Surface, Swapchain,
+};
+use vulkano::sync::{GpuFuture, SharingMode};
 use vulkano_win::VkSurfaceBuild;
+use winit::{dpi::LogicalSize, Event, EventsLoop, Window, WindowBuilder, WindowEvent};
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -72,8 +64,7 @@ impl QueueFamilyIndices {
 }
 
 struct HelloTriangle {
-    // sdl stuff
-    sdl_ctx: sdl2::Sdl,
+    events_loop: EventsLoop,
 
     // Vulkan stuff
 
@@ -106,9 +97,8 @@ struct HelloTriangle {
 impl Default for HelloTriangle {
     fn default() -> Self {
         // Sdl
-        let sdl_ctx = Self::init_sdl_ctx();
         let instance = Self::init_instance();
-        let surface = Self::init_surface(&sdl_ctx, &instance);
+        let (events_loop, surface) = Self::init_winit(&instance);
 
         // Vulkan
         let debug_callback = Self::init_debug_callback(&instance);
@@ -130,15 +120,9 @@ impl Default for HelloTriangle {
         let graphics_pipeline =
             Self::init_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
         let swap_chain_framebuffers = Self::init_framebuffers(&swap_chain_images, &render_pass);
-        let command_buffers = Self::init_command_buffers(
-            &graphics_pipeline,
-            &swap_chain_framebuffers,
-            &device,
-            &graphics_queue,
-        );
 
-        Self {
-            sdl_ctx,
+        let mut app = Self {
+            events_loop,
 
             instance,
             surface,
@@ -147,7 +131,7 @@ impl Default for HelloTriangle {
             render_pass,
             graphics_pipeline,
             swap_chain_framebuffers,
-            command_buffers,
+            command_buffers: vec![],
             physical_device_index,
 
             device,
@@ -155,7 +139,9 @@ impl Default for HelloTriangle {
             present_queue,
 
             debug_callback,
-        }
+        };
+        app.init_command_buffers();
+        app
     }
 }
 
@@ -163,20 +149,21 @@ impl HelloTriangle {
     /*Public fns*/
 
     pub fn run(&mut self) {
-        let mut event_pump = self.sdl_ctx.event_pump().unwrap();
-
-        'running: loop {
+        loop {
             self.draw_frame();
 
-            for event in event_pump.poll_iter() {
-                match event {
-                    Event::Quit { .. }
-                    | Event::KeyDown {
-                        keycode: Some(Keycode::Escape),
-                        ..
-                    } => break 'running,
-                    _ => {}
+            let mut done = false;
+            self.events_loop.poll_events(|ev| {
+                if let Event::WindowEvent {
+                    event: WindowEvent::CloseRequested,
+                    ..
+                } = ev
+                {
+                    done = true
                 }
+            });
+            if done {
+                return;
             }
         }
     }
@@ -202,27 +189,14 @@ impl HelloTriangle {
     }
 
     /* private init fns */
-
-    fn init_sdl_ctx() -> sdl2::Sdl {
-        let ctx = sdl2::init().unwrap();
-        ctx
-    }
-
-    fn init_surface(ctx: &sdl2::Sdl, instance: &Arc<Instance>) -> Arc<Surface<Window>> {
-        let video_subsystem = ctx.video().unwrap();
-        let window = video_subsystem
-            .window("Vulkan", WIDTH, HEIGHT)
-            .vulkan()
-            .build()
-            .unwrap();
-
-        let surface_hnd = window
-            .vulkan_create_surface(instance.internal_object())
-            .unwrap();
-        let surface =
-            unsafe { Surface::from_raw_surface(instance.to_owned(), surface_hnd, window) };
-
-        Arc::new(surface)
+    fn init_winit(instance: &Arc<Instance>) -> (EventsLoop, Arc<Surface<Window>>) {
+        let events_loop = EventsLoop::new();
+        let surface = WindowBuilder::new()
+            .with_title("Vulkan")
+            .with_dimensions(LogicalSize::new(f64::from(WIDTH), f64::from(HEIGHT)))
+            .build_vk_surface(&events_loop, instance.clone())
+            .expect("failed to create window surface!");
+        (events_loop, surface)
     }
 
     fn init_instance() -> Arc<Instance> {
@@ -456,24 +430,19 @@ impl HelloTriangle {
             .collect::<Vec<_>>()
     }
 
-    fn init_command_buffers(
-        graphics_pipeline: &Arc<ConcreteGraphicsPipeline>,
-        swap_chain_framebuffers: &Vec<Arc<FramebufferAbstract + Send + Sync>>,
-        device: &Arc<Device>,
-        graphics_queue: &Arc<Queue>,
-    ) -> Vec<Arc<AutoCommandBuffer>> {
-        let queue_family = graphics_queue.family();
-        let command_buffers = swap_chain_framebuffers
+    fn init_command_buffers(&mut self) {
+        let queue_family = self.graphics_queue.family();
+        self.command_buffers = self
+            .swap_chain_framebuffers
             .iter()
             .map(|framebuffer| {
-                let verticies = BufferlessVertices {
+                let vertices = BufferlessVertices {
                     vertices: 3,
                     instances: 1,
                 };
-
                 Arc::new(
                     AutoCommandBufferBuilder::primary_simultaneous_use(
-                        device.clone(),
+                        self.device.clone(),
                         queue_family,
                     )
                     .unwrap()
@@ -481,25 +450,23 @@ impl HelloTriangle {
                         framebuffer.clone(),
                         false,
                         vec![[0.0, 0.0, 0.0, 1.0].into()],
-                    ),
+                    )
+                    .unwrap()
+                    .draw(
+                        self.graphics_pipeline.clone(),
+                        &DynamicState::none(),
+                        vertices,
+                        (),
+                        (),
+                    )
+                    .unwrap()
+                    .end_render_pass()
+                    .unwrap()
+                    .build()
+                    .unwrap(),
                 )
-                .unwrap()
-                .draw(
-                    graphics_pipeline.clone(),
-                    &DynamicState::none(),
-                    verticies,
-                    (),
-                    (),
-                )
-                .unwrap()
-                .end_render_pass()
-                .unwrap()
-                .build()
-                .unwrap()
             })
-            .collect();
-
-        command_buffers
+            .collect()
     }
 
     fn init_debug_callback(instance: &Arc<Instance>) -> Option<DebugCallback> {
