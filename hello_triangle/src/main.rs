@@ -20,10 +20,10 @@ use vulkano::pipeline::{
     vertex::BufferlessDefinition, vertex::BufferlessVertices, viewport::Viewport, GraphicsPipeline,
 };
 use vulkano::swapchain::{
-    acquire_next_image, Capabilities, ColorSpace, CompositeAlpha, PresentMode,
+    acquire_next_image, AcquireError, Capabilities, ColorSpace, CompositeAlpha, PresentMode,
     SupportedPresentModes, Surface, Swapchain,
 };
-use vulkano::sync::{GpuFuture, SharingMode};
+use vulkano::sync::{self, GpuFuture, SharingMode};
 use vulkano_win::VkSurfaceBuild;
 use winit::{dpi::LogicalSize, Event, EventsLoop, Window, WindowBuilder, WindowEvent};
 
@@ -81,6 +81,8 @@ struct HelloTriangle {
     graphics_pipeline: Arc<ConcreteGraphicsPipeline>,
     swap_chain_framebuffers: Vec<Arc<FramebufferAbstract + Send + Sync>>,
     command_buffers: Vec<Arc<AutoCommandBuffer>>,
+    previous_frame_end: Option<Box<GpuFuture>>,
+    recreate_swap_chain: bool,
 
     // Physical Device
     physical_device_index: usize,
@@ -91,22 +93,27 @@ struct HelloTriangle {
     present_queue: Arc<Queue>,
 
     // Debug stuff for vulkan. Hook to validation layers.
+    #[allow(unused)]
     debug_callback: Option<DebugCallback>,
 }
 
 impl Default for HelloTriangle {
     fn default() -> Self {
-        // Sdl
+        // First step in Vulkan is to instantiate an instance.
         let instance = Self::init_instance();
+
+        // Next, we instantiate our window surface and events with winit.
         let (events_loop, surface) = Self::init_winit(&instance);
 
-        // Vulkan
-        let debug_callback = Self::init_debug_callback(&instance);
+        // Here, we choose which physical device shall be used.
         let physical_device_index = Self::init_physical_device(&instance, &surface);
 
+        // At this step, we create a logical device out of the physical device.
+        // This also includes the queues that will be used to communicate with the device.
         let (device, graphics_queue, present_queue) =
             Self::init_logical_device(&instance, &surface, physical_device_index);
 
+        // This method instantiates the swap chain. The swap chain hold the buffers that are ultimately sent to the screen.
         let (swap_chain, swap_chain_images) = Self::init_swap_chain(
             &instance,
             &surface,
@@ -114,12 +121,24 @@ impl Default for HelloTriangle {
             &device,
             &graphics_queue,
             &present_queue,
+            None,
         );
 
+        // At this point we instantiate the render pass. The render pass describes to the graphics pipeline things like
+        // output direction, color layout, and depth/stencil information.
         let render_pass = Self::init_render_pass(&device, swap_chain.format());
+
+        // Now we finally create the graphics pipeline. Specifies the entire pipeline upfront.
         let graphics_pipeline =
             Self::init_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
+
+        // The framebuffers that go with the created render pass.
         let swap_chain_framebuffers = Self::init_framebuffers(&swap_chain_images, &render_pass);
+
+        let previous_frame_end = Some(Self::init_sync_objects(&device));
+
+        // Finally, we instantiate the debug callback. This function handles if we want it or not.
+        let debug_callback = Self::init_debug_callback(&instance);
 
         let mut app = Self {
             events_loop,
@@ -132,6 +151,8 @@ impl Default for HelloTriangle {
             graphics_pipeline,
             swap_chain_framebuffers,
             command_buffers: vec![],
+            previous_frame_end,
+            recreate_swap_chain: false,
             physical_device_index,
 
             device,
@@ -140,6 +161,8 @@ impl Default for HelloTriangle {
 
             debug_callback,
         };
+
+        // This is where we instantiate the command buffers.
         app.init_command_buffers();
         app
     }
@@ -169,12 +192,30 @@ impl HelloTriangle {
     }
 
     pub fn draw_frame(&mut self) {
-        let (image_index, acquire_future) =
-            acquire_next_image(self.swap_chain.clone(), None).unwrap();
+        self.previous_frame_end.as_mut().unwrap().cleanup_finished();
+
+        if self.recreate_swap_chain {
+            self.recreate_swap_chain();
+            self.recreate_swap_chain = false;
+        }
+
+        let (image_index, acquire_future) = match acquire_next_image(self.swap_chain.clone(), None)
+        {
+            Ok(r) => r,
+            Err(AcquireError::OutOfDate) => {
+                self.recreate_swap_chain = true;
+                return;
+            }
+            Err(err) => panic!("{:?}", err),
+        };
 
         let command_buffer = self.command_buffers[image_index].clone();
 
-        let future = acquire_future
+        let future = self
+            .previous_frame_end
+            .take()
+            .unwrap()
+            .join(acquire_future)
             .then_execute(self.graphics_queue.clone(), command_buffer)
             .unwrap()
             .then_swapchain_present(
@@ -182,23 +223,31 @@ impl HelloTriangle {
                 self.swap_chain.clone(),
                 image_index,
             )
-            .then_signal_fence_and_flush()
-            .unwrap();
+            .then_signal_fence_and_flush();
 
-        future.wait(None).unwrap();
+        match future {
+            Ok(future) => {
+                self.previous_frame_end = Some(Box::new(future) as Box<_>);
+            }
+            Err(vulkano::sync::FlushError::OutOfDate) => {
+                self.recreate_swap_chain = true;
+                self.previous_frame_end =
+                    Some(Box::new(vulkano::sync::now(self.device.clone())) as Box<_>);
+            }
+            Err(err) => {
+                println!("{:?}", err);
+                self.previous_frame_end =
+                    Some(Box::new(vulkano::sync::now(self.device.clone())) as Box<_>);
+            }
+        }
     }
 
-    /* private init fns */
-    fn init_winit(instance: &Arc<Instance>) -> (EventsLoop, Arc<Surface<Window>>) {
-        let events_loop = EventsLoop::new();
-        let surface = WindowBuilder::new()
-            .with_title("Vulkan")
-            .with_dimensions(LogicalSize::new(f64::from(WIDTH), f64::from(HEIGHT)))
-            .build_vk_surface(&events_loop, instance.clone())
-            .expect("failed to create window surface!");
-        (events_loop, surface)
-    }
-
+    /*
+    To instantiate a Vulkan instance we do the following:
+        1. Initialized application info
+        2. Get required extensions, by using vulkano-win
+        3. Add validation layers, if enabled.
+    */
     fn init_instance() -> Arc<Instance> {
         if ENABLE_VALIDATION_LAYERS && !Self::check_validation_layer_support() {
             println!("Validation layers requested, but not available!")
@@ -237,6 +286,33 @@ impl HelloTriangle {
 
         return Instance::new(Some(&app_info), &required_extensions, None)
             .expect("failed to create Vulkan instance");
+    }
+
+    /*
+     To instantiate a Window we do the following:
+        1. Create the events loop
+        2. Create the window surface, tying it to the vulkan surface.
+    */
+    fn init_winit(instance: &Arc<Instance>) -> (EventsLoop, Arc<Surface<Window>>) {
+        let events_loop = EventsLoop::new();
+        let surface = WindowBuilder::new()
+            .with_title("Vulkan")
+            .with_dimensions(LogicalSize::new(f64::from(WIDTH), f64::from(HEIGHT)))
+            .build_vk_surface(&events_loop, instance.clone())
+            .expect("failed to create window surface!");
+        (events_loop, surface)
+    }
+
+    /*
+    To instantiate and choose our physical device we have to do the following.
+        1. Filter devices without request features.
+        2. Filter devices unable to support the surface.
+        3. Leave the rest up to the user/some priority heuristic.
+    */
+    fn init_physical_device(instance: &Arc<Instance>, surface: &Arc<Surface<Window>>) -> usize {
+        PhysicalDevice::enumerate(&instance)
+            .position(|device| Self::is_device_suitable(surface, &device))
+            .expect("failed to find a suitable GPU!")
     }
 
     fn init_logical_device(
@@ -279,6 +355,7 @@ impl HelloTriangle {
         device: &Arc<Device>,
         graphics_queue: &Arc<Queue>,
         present_queue: &Arc<Queue>,
+        old_swap_chain: Option<Arc<Swapchain<Window>>>,
     ) -> (Arc<Swapchain<Window>>, Vec<Arc<SwapchainImage<Window>>>) {
         let physical_device = PhysicalDevice::from_index(&instance, physical_device_index).unwrap();
         let capabilities = surface
@@ -322,11 +399,15 @@ impl HelloTriangle {
             CompositeAlpha::Opaque,
             present_mode,
             true,
-            None,
+            old_swap_chain.as_ref(),
         )
         .expect("failed to create swap chain!");
 
         (swap_chain, images)
+    }
+
+    fn init_sync_objects(device: &Arc<Device>) -> Box<GpuFuture> {
+        Box::new(sync::now(device.clone())) as Box<GpuFuture>
     }
 
     fn init_render_pass(
@@ -407,15 +488,6 @@ impl HelloTriangle {
         swap_chain_images: &[Arc<SwapchainImage<Window>>],
         render_pass: &Arc<RenderPassAbstract + Send + Sync>,
     ) -> Vec<Arc<FramebufferAbstract + Send + Sync>> {
-        //        let dimensions = images[0].dimensions();
-        //
-        //        let viewport = Viewport {
-        //            origin: [0.0, 0.0],
-        //            dimensions: [dimensions[0] as f32, dimensions[1] as f32],
-        //            depth_range: 0.0..1.0,
-        //        };
-        //        dynamic_state.viewports = Some(vec!(viewport));
-
         swap_chain_images
             .iter()
             .map(|image| {
@@ -485,12 +557,6 @@ impl HelloTriangle {
             println!("validation layer: {:?}", msg.description);
         })
         .ok()
-    }
-
-    fn init_physical_device(instance: &Arc<Instance>, surface: &Arc<Surface<Window>>) -> usize {
-        PhysicalDevice::enumerate(&instance)
-            .position(|device| Self::is_device_suitable(surface, &device))
-            .expect("failed to find a suitable GPU!")
     }
 
     /* private fns */
@@ -595,6 +661,30 @@ impl HelloTriangle {
         };
 
         indices.is_complete() && extensions_supported && swap_chain_adequate
+    }
+
+    fn recreate_swap_chain(&mut self) {
+        let (swap_chain, images) = Self::init_swap_chain(
+            &self.instance,
+            &self.surface,
+            self.physical_device_index,
+            &self.device,
+            &self.graphics_queue,
+            &self.present_queue,
+            Some(self.swap_chain.clone()),
+        );
+        self.swap_chain = swap_chain;
+        self.swap_chain_images = images;
+
+        self.render_pass = Self::init_render_pass(&self.device, self.swap_chain.format());
+        self.graphics_pipeline = Self::init_graphics_pipeline(
+            &self.device,
+            self.swap_chain.dimensions(),
+            &self.render_pass,
+        );
+        self.swap_chain_framebuffers =
+            Self::init_framebuffers(&self.swap_chain_images, &self.render_pass);
+        self.init_command_buffers();
     }
 }
 
