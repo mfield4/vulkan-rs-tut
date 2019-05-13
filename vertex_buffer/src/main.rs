@@ -152,7 +152,7 @@ impl Default for HelloTriangle {
         // The framebuffers that go with the created render pass.
         let swap_chain_framebuffers = Self::init_framebuffers(&swap_chain_images, &render_pass);
 
-        let vertex_buffer = Self::init_vertex_buffer(&device);
+        let vertex_buffer = Self::init_vertex_buffer(&graphics_queue);
 
         let previous_frame_end = Some(Self::init_sync_objects(&device));
 
@@ -426,13 +426,12 @@ impl HelloTriangle {
         (swap_chain, images)
     }
 
-    fn init_vertex_buffer(device: &Arc<Device>) -> Arc<BufferAccess + Send + Sync> {
-        CpuAccessibleBuffer::from_iter(
-            device.clone(),
-            BufferUsage::vertex_buffer(),
-            vertices().iter().cloned(),
-        )
-        .unwrap()
+    fn init_vertex_buffer(graphics_queue: &Arc<Queue>) -> Arc<BufferAccess + Send + Sync> {
+        let (buffer, future) = ImmutableBuffer::from_iter(
+            vertices().iter().cloned(), BufferUsage::vertex_buffer(), graphics_queue.clone()).unwrap();
+
+        future.flush().unwrap();
+        buffer
     }
 
     fn init_sync_objects(device: &Arc<Device>) -> Box<GpuFuture> {
