@@ -4,27 +4,48 @@ extern crate vulkano_shaders;
 extern crate vulkano_win;
 extern crate winit;
 
-use std::{collections::HashSet, iter::FromIterator, sync::Arc};
-use vulkano::buffer::{BufferAccess, BufferUsage, CpuAccessibleBuffer, ImmutableBuffer};
-use vulkano::command_buffer::{AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState};
-use vulkano::descriptor::PipelineLayoutAbstract;
-use vulkano::device::{Device, DeviceExtensions, Features, Queue};
-use vulkano::format::Format;
-use vulkano::framebuffer::{Framebuffer, FramebufferAbstract, RenderPassAbstract, Subpass};
-use vulkano::image::{swapchain::SwapchainImage, ImageUsage};
-use vulkano::instance::debug::{DebugCallback, MessageTypes};
-use vulkano::instance::{
-    layers_list, ApplicationInfo, Instance, InstanceExtensions, PhysicalDevice, Version,
+use core::borrow::Borrow;
+use std::{collections::HashSet, iter::FromIterator, sync::Arc, time::Instant};
+use std::fs::read;
+
+use cgmath::{
+    Deg,
+    Matrix3,
+    Matrix4,
+    Point3,
+    Rad,
+    Vector3,
 };
-use vulkano::pipeline::{
-    vertex::BufferlessDefinition, vertex::BufferlessVertices, viewport::Viewport, GraphicsPipeline,
-    GraphicsPipelineAbstract,
+use image::ImageFormat;
+use vulkano::{
+    buffer::{BufferAccess, BufferUsage, CpuAccessibleBuffer, CpuBufferPool, ImmutableBuffer, TypedBufferAccess},
+    command_buffer::{AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState},
+    descriptor::{
+        descriptor::DescriptorDesc,
+        descriptor_set::PersistentDescriptorSet,
+        DescriptorSet,
+        PipelineLayoutAbstract,
+    },
+    device::{Device, DeviceExtensions, Features, Queue},
+    format::Format,
+    framebuffer::{Framebuffer, FramebufferAbstract, RenderPassAbstract, Subpass},
+    image::{Dimensions, ImageUsage, ImmutableImage, swapchain::SwapchainImage},
+    instance::{
+        ApplicationInfo, Instance, InstanceExtensions, layers_list, PhysicalDevice, Version,
+    },
+    instance::debug::{DebugCallback, MessageTypes},
+    memory::DedicatedAlloc::Buffer,
+    pipeline::{
+        GraphicsPipeline, GraphicsPipelineAbstract, vertex::BufferlessDefinition, vertex::BufferlessVertices,
+        viewport::Viewport,
+    },
+    sampler::{Filter, MipmapMode, Sampler, SamplerAddressMode},
+    swapchain::{
+        acquire_next_image, AcquireError, Capabilities, ColorSpace, CompositeAlpha, PresentMode,
+        SupportedPresentModes, Surface, Swapchain,
+    },
+    sync::{self, GpuFuture, SharingMode},
 };
-use vulkano::swapchain::{
-    acquire_next_image, AcquireError, Capabilities, ColorSpace, CompositeAlpha, PresentMode,
-    SupportedPresentModes, Surface, Swapchain,
-};
-use vulkano::sync::{self, GpuFuture, SharingMode};
 use vulkano_win::VkSurfaceBuild;
 use winit::{dpi::LogicalSize, Event, EventsLoop, Window, WindowBuilder, WindowEvent};
 
@@ -62,25 +83,42 @@ impl QueueFamilyIndices {
 struct Vertex {
     pos: [f32; 2],
     color: [f32; 3],
+    texCoord: [f32; 2],
 }
 
 impl Vertex {
-    fn new(pos: [f32; 2], color: [f32; 3]) -> Self {
-        Self { pos, color }
+    fn new(pos: [f32; 2], color: [f32; 3], texCoord: [f32; 2]) -> Self {
+        Self { pos, color, texCoord }
     }
 }
-impl_vertex!(Vertex, pos, color);
 
-fn vertices() -> [Vertex; 3] {
+impl_vertex!(Vertex, pos, color, texCoord);
+
+#[derive(Copy, Clone)]
+struct UniformBufferObject {
+    model: Matrix4<f32>,
+    view: Matrix4<f32>,
+    proj: Matrix4<f32>,
+}
+
+fn vertices() -> [Vertex; 4] {
     [
-        Vertex::new([0.0, -0.3], [1.0, 0.0, 0.0]),
-        Vertex::new([0.5, 0.5], [0.0, 1.0, 0.0]),
-        Vertex::new([-0.5, 0.7], [0.0, 0.0, 1.0]),
+        Vertex::new([-0.5, -0.5], [1.0, 0.0, 0.0], [1.0, 0.0]),
+        Vertex::new([0.5, -0.5], [0.0, 1.0, 0.0], [0.0, 0.0]),
+        Vertex::new([0.5, 0.5], [0.0, 0.0, 1.0], [0.0, 1.0]),
+        Vertex::new([-0.5, 0.5], [1.0, 1.0, 1.0], [1.0, 1.0])
     ]
 }
 
+fn indices() -> [u16; 6] {
+    [0, 1, 2, 2, 3, 0]
+}
+
+
 struct HelloTriangle {
     events_loop: EventsLoop,
+
+    degrees: f32,
 
     // Vulkan stuff
 
@@ -97,9 +135,16 @@ struct HelloTriangle {
     graphics_pipeline: Arc<GraphicsPipelineAbstract + Send + Sync>,
     swap_chain_framebuffers: Vec<Arc<FramebufferAbstract + Send + Sync>>,
     vertex_buffer: Arc<BufferAccess + Send + Sync>,
+    index_buffer: Arc<TypedBufferAccess<Content=[u16]> + Send + Sync>,
+    uniform_buffers: CpuBufferPool<UniformBufferObject>,
+    descriptor_set: Arc<DescriptorSet + Send + Sync>,
     command_buffers: Vec<Arc<AutoCommandBuffer>>,
     previous_frame_end: Option<Box<GpuFuture>>,
     recreate_swap_chain: bool,
+    start_time: Instant,
+
+    texture: Arc<ImmutableImage<Format>>,
+    sampler: Arc<Sampler>,
 
     // Physical Device
     physical_device_index: usize,
@@ -146,15 +191,45 @@ impl Default for HelloTriangle {
         let render_pass = Self::init_render_pass(&device, swap_chain.format());
 
         // Now we finally create the graphics pipeline. Specifies the entire pipeline upfront.
-        let graphics_pipeline =
-            Self::init_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
+        let graphics_pipeline = Self::init_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
 
         // The framebuffers that go with the created render pass.
         let swap_chain_framebuffers = Self::init_framebuffers(&swap_chain_images, &render_pass);
 
+        let start_time = Instant::now();
+
         let vertex_buffer = Self::init_vertex_buffer(&graphics_queue);
+        let index_buffer = Self::init_index_buffer(&graphics_queue);
 
         let previous_frame_end = Some(Self::init_sync_objects(&device));
+
+        let (texture, tex_future) = {
+            let image = image::load_from_memory_with_format(include_bytes!("/home/mfield/Projects/Rust/vulkan/vertex_buffer/src/test.png"), ImageFormat::PNG).unwrap().to_rgba();
+            let image_data = image.into_raw().clone();
+
+
+            ImmutableImage::from_iter(
+                image_data.iter().cloned(),
+                Dimensions::Dim2d { width: 93, height: 93 },
+                Format::R8G8B8A8Srgb,
+                graphics_queue.clone(),
+            ).unwrap()
+        };
+
+        let sampler = Sampler::new(device.clone(), Filter::Linear, Filter::Linear,
+                                   MipmapMode::Nearest, SamplerAddressMode::Repeat, SamplerAddressMode::Repeat,
+                                   SamplerAddressMode::Repeat, 0.0, 1.0, 0.0, 0.0).unwrap();
+
+        let (uniform_buffers, descriptor_set) = Self::init_uniform_buffers(
+            device.clone(),
+            graphics_pipeline.clone(),
+            graphics_queue.clone(),
+            texture.clone(),
+            sampler.clone(),
+            swap_chain_images.len(),
+            start_time,
+            swap_chain.dimensions(),
+        );
 
         // Finally, we instantiate the debug callback. This function handles if we want it or not.
         let debug_callback = Self::init_debug_callback(&instance);
@@ -162,6 +237,7 @@ impl Default for HelloTriangle {
         let mut app = Self {
             events_loop,
 
+            degrees: 0.0,
             instance,
             surface,
             swap_chain,
@@ -170,9 +246,15 @@ impl Default for HelloTriangle {
             graphics_pipeline,
             swap_chain_framebuffers,
             vertex_buffer,
+            index_buffer,
+            uniform_buffers,
+            descriptor_set,
             command_buffers: vec![],
             previous_frame_end,
             recreate_swap_chain: false,
+            start_time,
+            texture,
+            sampler,
             physical_device_index,
 
             device,
@@ -187,6 +269,7 @@ impl Default for HelloTriangle {
         app
     }
 }
+
 
 impl HelloTriangle {
     /*Public fns*/
@@ -219,15 +302,20 @@ impl HelloTriangle {
             self.recreate_swap_chain = false;
         }
 
+
         let (image_index, acquire_future) = match acquire_next_image(self.swap_chain.clone(), None)
-        {
-            Ok(r) => r,
-            Err(AcquireError::OutOfDate) => {
-                self.recreate_swap_chain = true;
-                return;
-            }
-            Err(err) => panic!("{:?}", err),
-        };
+            {
+                Ok(r) => r,
+                Err(AcquireError::OutOfDate) => {
+                    self.recreate_swap_chain = true;
+                    return;
+                }
+                Err(err) => panic!("{:?}", err),
+            };
+
+        println!("image index = {}", image_index);
+
+        self.update_uniform_buffer(image_index);
 
         let command_buffer = self.command_buffers[image_index].clone();
 
@@ -301,7 +389,7 @@ impl HelloTriangle {
                 &required_extensions,
                 VALIDATION_LAYERS.iter().cloned(),
             )
-            .expect("failed to create Vulkan instance");
+                .expect("failed to create Vulkan instance");
         }
 
         return Instance::new(Some(&app_info), &required_extensions, None)
@@ -360,7 +448,7 @@ impl HelloTriangle {
             &device_extensions(),
             queue_families,
         )
-        .expect("failed to create logical device!");
+            .expect("failed to create logical device!");
 
         let graphics_queue = queues.next().unwrap();
         let present_queue = queues.next().unwrap_or_else(|| graphics_queue.clone());
@@ -421,17 +509,56 @@ impl HelloTriangle {
             true,
             old_swap_chain.as_ref(),
         )
-        .expect("failed to create swap chain!");
+            .expect("failed to create swap chain!");
 
         (swap_chain, images)
     }
 
     fn init_vertex_buffer(graphics_queue: &Arc<Queue>) -> Arc<BufferAccess + Send + Sync> {
         let (buffer, future) = ImmutableBuffer::from_iter(
-            vertices().iter().cloned(), BufferUsage::vertex_buffer(), graphics_queue.clone()).unwrap();
+            vertices().iter().cloned(), BufferUsage::all(), graphics_queue.clone()).unwrap();
 
         future.flush().unwrap();
         buffer
+    }
+
+    fn init_index_buffer(graphics_queue: &Arc<Queue>) -> Arc<TypedBufferAccess<Content=[u16]> + Send + Sync> {
+        let (buffer, future) = ImmutableBuffer::from_iter(
+            indices().iter().cloned(), BufferUsage::all(), graphics_queue.clone()).unwrap();
+
+        future.flush().unwrap();
+        buffer
+    }
+
+    fn init_uniform_buffers(
+        device: Arc<Device>,
+        graphics_pipeline: Arc<GraphicsPipelineAbstract + Send + Sync>,
+        graphics_queue: Arc<Queue>,
+        texture: Arc<ImmutableImage<Format>>,
+        sampler: Arc<Sampler>,
+        num_buffers: usize,
+        start_time: Instant,
+        dimensions_u32: [u32; 2],
+    ) -> (CpuBufferPool<UniformBufferObject>, Arc<DescriptorSet + Send + Sync>) {
+        let dimensions = [dimensions_u32[0] as f32, dimensions_u32[1] as f32];
+        let uniform_buffer = Self::uniform_buffer(start_time, dimensions);
+        let buffer = CpuBufferPool::uniform_buffer(device.clone());
+//
+
+        let descriptor_set = Arc::new(
+            PersistentDescriptorSet::start(graphics_pipeline.clone(), 0)
+                .add_buffer(buffer.next(uniform_buffer).unwrap()).unwrap()
+                .add_sampled_image(texture.clone(), sampler.clone()).unwrap()
+                .build().unwrap()
+        );
+//
+//        let descriptor_set_2 = Arc::new(
+//            PersistentDescriptorSet::start(graphics_pipeline.clone(), 0)
+//                .add_sampled_image(texture.clone(), sampler.clone()).unwrap()
+//                .build().unwrap()
+//        );
+
+        (buffer, descriptor_set)
     }
 
     fn init_sync_objects(device: &Arc<Device>) -> Box<GpuFuture> {
@@ -457,9 +584,10 @@ impl HelloTriangle {
                     depth_stencil: {}
                 }
             )
-            .unwrap(),
+                .unwrap(),
         )
     }
+
 
     fn init_graphics_pipeline(
         device: &Arc<Device>,
@@ -503,8 +631,8 @@ impl HelloTriangle {
                 .depth_clamp(false)
                 .polygon_mode_fill()
                 .line_width(1.0) // default
-                .cull_mode_back()
-                .front_face_clockwise()
+                .cull_mode_disabled()
+                .front_face_counter_clockwise()
                 .blend_pass_through()
                 .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
                 .build(device.clone())
@@ -532,6 +660,8 @@ impl HelloTriangle {
 
     fn init_command_buffers(&mut self) {
         let queue_family = self.graphics_queue.family();
+
+
         self.command_buffers = self
             .swap_chain_framebuffers
             .iter()
@@ -541,29 +671,24 @@ impl HelloTriangle {
                         self.device.clone(),
                         queue_family,
                     )
-                    .unwrap()
-                    .begin_render_pass(
-                        framebuffer.clone(),
-                        false,
-                        vec![[0.0, 0.0, 0.0, 1.0].into()],
-                    )
-                    .unwrap()
-                    .draw(
-                        self.graphics_pipeline.clone(),
-                        &DynamicState::none(),
-                        vec![self.vertex_buffer.clone()],
-                        (),
-                        (),
-                    )
-                    .unwrap()
-                    .end_render_pass()
-                    .unwrap()
-                    .build()
-                    .unwrap(),
+                        .unwrap()
+                        .begin_render_pass(
+                            framebuffer.clone(),
+                            false,
+                            vec![[0.0, 0.0, 0.0, 1.0].into()],
+                        )
+                        .unwrap()
+                        .draw_indexed(self.graphics_pipeline.clone(), &DynamicState::none(), vec![self.vertex_buffer.clone()], self.index_buffer.clone(), (self.descriptor_set.clone()), ())
+                        .unwrap()
+                        .end_render_pass()
+                        .unwrap()
+                        .build()
+                        .unwrap(),
                 )
             })
             .collect()
     }
+
 
     fn init_debug_callback(instance: &Arc<Instance>) -> Option<DebugCallback> {
         if !ENABLE_VALIDATION_LAYERS {
@@ -580,7 +705,7 @@ impl HelloTriangle {
         DebugCallback::new(&instance, msg_types, |msg| {
             println!("validation layer: {:?}", msg.description);
         })
-        .ok()
+            .ok()
     }
 
     /* private fns */
@@ -708,6 +833,65 @@ impl HelloTriangle {
         );
         self.swap_chain_framebuffers =
             Self::init_framebuffers(&self.swap_chain_images, &self.render_pass);
+
+        let (uni_buffers, descriptor_set) = Self::init_uniform_buffers(
+            self.device.clone(),
+            self.graphics_pipeline.clone(),
+            self.graphics_queue.clone(),
+            self.texture.clone(),
+            self.sampler.clone(),
+            self.swap_chain_images.len(),
+            Instant::now(), self.swap_chain.dimensions(),
+        );
+
+        self.uniform_buffers = uni_buffers;
+        self.descriptor_set = descriptor_set;
+        self.init_command_buffers();
+    }
+
+    fn uniform_buffer(start_time: Instant, dimensions: [f32; 2]) -> UniformBufferObject {
+        let elapsed = Instant::now().duration_since(start_time);
+        let rotation = elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
+
+        println!("Rotation: {}", rotation);
+
+        let rotation = Matrix3::from_angle_z(Rad(rotation as f32));
+
+
+        // note: this teapot was meant for OpenGL where the origin is at the lower left
+        //       instead the origin is at the upper left in Vulkan, so we reverse the Y axis
+        let aspect_ratio = dimensions[0] as f32 / dimensions[1] as f32;
+
+        let mut proj = cgmath::perspective(Deg(45.0), aspect_ratio, 0.01, 10.0);
+        proj.y.y *= -1.0;
+
+        let view = Matrix4::look_at(Point3::new(2.0, 2.0, 2.0), Point3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0));
+
+        let scale = Matrix4::from_scale(0.5);
+
+        UniformBufferObject {
+            model: Matrix4::from(rotation).into(),
+            view: (view * scale).into(),
+            proj: proj.into(),
+        }
+    }
+
+    fn update_uniform_buffer(&mut self, image_index: usize) {
+        let dimensions_u32 = self.swap_chain.dimensions();
+        let dimensions = [dimensions_u32[0] as f32, dimensions_u32[1] as f32];
+        let uniform_buffer = Self::uniform_buffer(self.start_time, dimensions);
+
+        self.descriptor_set = Arc::new(
+            PersistentDescriptorSet::start(self.graphics_pipeline.clone(), 0)
+                .add_buffer(self.uniform_buffers.next(uniform_buffer).unwrap()).unwrap()
+                .add_sampled_image(self.texture.clone(), self.sampler.clone()).unwrap()
+                .build().unwrap()
+        );
+//
+//        self.descriptor_set_2 = Arc::new(PersistentDescriptorSet::start(self.graphics_pipeline.clone(), 0)
+//            .build().unwrap()
+//        );
+
         self.init_command_buffers();
     }
 }
