@@ -46,8 +46,10 @@ use vulkano::{
     },
     sync::{self, GpuFuture, SharingMode},
 };
+use vulkano::image::AttachmentImage;
 use vulkano_win::VkSurfaceBuild;
 use winit::{dpi::LogicalSize, Event, EventsLoop, Window, WindowBuilder, WindowEvent};
+use vulkano::format::ClearValue;
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -81,13 +83,13 @@ impl QueueFamilyIndices {
 
 #[derive(Copy, Clone)]
 struct Vertex {
-    pos: [f32; 2],
+    pos: [f32; 3],
     color: [f32; 3],
     texCoord: [f32; 2],
 }
 
 impl Vertex {
-    fn new(pos: [f32; 2], color: [f32; 3], texCoord: [f32; 2]) -> Self {
+    fn new(pos: [f32; 3], color: [f32; 3], texCoord: [f32; 2]) -> Self {
         Self { pos, color, texCoord }
     }
 }
@@ -101,17 +103,21 @@ struct UniformBufferObject {
     proj: Matrix4<f32>,
 }
 
-fn vertices() -> [Vertex; 4] {
+fn vertices() -> [Vertex; 8] {
     [
-        Vertex::new([-0.5, -0.5], [1.0, 0.0, 0.0], [1.0, 0.0]),
-        Vertex::new([0.5, -0.5], [0.0, 1.0, 0.0], [0.0, 0.0]),
-        Vertex::new([0.5, 0.5], [0.0, 0.0, 1.0], [0.0, 1.0]),
-        Vertex::new([-0.5, 0.5], [1.0, 1.0, 1.0], [1.0, 1.0])
+        Vertex::new([-0.5, -0.5, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0]),
+        Vertex::new([0.5, -0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0]),
+        Vertex::new([0.5, 0.5, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0]),
+        Vertex::new([-0.5, 0.5, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0]),
+        Vertex::new([-0.5, -0.5, -0.5], [1.0, 0.0, 0.0], [1.0, 0.0]),
+        Vertex::new([0.5, -0.5, -0.5], [0.0, 1.0, 0.0], [0.0, 0.0]),
+        Vertex::new([0.5, 0.5, -0.5], [0.0, 0.0, 1.0], [0.0, 1.0]),
+        Vertex::new([-0.5, 0.5, -0.5], [1.0, 1.0, 1.0], [1.0, 1.0])
     ]
 }
 
-fn indices() -> [u16; 6] {
-    [0, 1, 2, 2, 3, 0]
+fn indices() -> [u16; 12] {
+    [0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4]
 }
 
 
@@ -194,7 +200,7 @@ impl Default for HelloTriangle {
         let graphics_pipeline = Self::init_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
 
         // The framebuffers that go with the created render pass.
-        let swap_chain_framebuffers = Self::init_framebuffers(&swap_chain_images, &render_pass);
+        let swap_chain_framebuffers = Self::init_framebuffers(&device, swap_chain.dimensions(), &swap_chain_images, &render_pass);
 
         let start_time = Instant::now();
 
@@ -569,25 +575,27 @@ impl HelloTriangle {
         device: &Arc<Device>,
         color_format: Format,
     ) -> Arc<RenderPassAbstract + Send + Sync> {
-        Arc::new(
-            single_pass_renderpass!(device.clone(),
-                attachments: {
-                    color: {
-                        load: Clear,
-                        store: Store,
-                        format: color_format,
-                        samples: 1,
-                    }
-                },
-               pass: {
-                    color: [color],
-                    depth_stencil: {}
+        Arc::new(single_pass_renderpass!(device.clone(),
+                                         attachments: {
+            color: {
+                load: Clear,
+                store: Store,
+                format: color_format,
+                samples: 1,
+            },
+            depth: {
+                    load: Clear,
+                    store: DontCare,
+                    format: Format::D16Unorm,
+                    samples: 1,
                 }
-            )
-                .unwrap(),
-        )
+            },
+            pass: {
+                color: [color],
+                depth_stencil: {depth}
+            }
+         ).unwrap(), )
     }
-
 
     fn init_graphics_pipeline(
         device: &Arc<Device>,
@@ -631,7 +639,8 @@ impl HelloTriangle {
                 .depth_clamp(false)
                 .polygon_mode_fill()
                 .line_width(1.0) // default
-                .cull_mode_disabled()
+                .cull_mode_back()
+                .depth_stencil_simple_depth()
                 .front_face_counter_clockwise()
                 .blend_pass_through()
                 .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
@@ -641,18 +650,21 @@ impl HelloTriangle {
     }
 
     fn init_framebuffers(
+        device: &Arc<Device>,
+        dimensions: [u32; 2],
         swap_chain_images: &[Arc<SwapchainImage<Window>>],
         render_pass: &Arc<RenderPassAbstract + Send + Sync>,
     ) -> Vec<Arc<FramebufferAbstract + Send + Sync>> {
+        let depth_buffer = AttachmentImage::transient(device.clone(), dimensions, Format::D16Unorm).unwrap();
+
         swap_chain_images
             .iter()
             .map(|image| {
                 Arc::new(
                     Framebuffer::start(render_pass.clone())
-                        .add(image.clone())
-                        .unwrap()
-                        .build()
-                        .unwrap(),
+                        .add(image.clone()).unwrap()
+                        .add(depth_buffer.clone()).unwrap()
+                        .build().unwrap(),
                 ) as Arc<FramebufferAbstract + Send + Sync>
             })
             .collect::<Vec<_>>()
@@ -675,7 +687,7 @@ impl HelloTriangle {
                         .begin_render_pass(
                             framebuffer.clone(),
                             false,
-                            vec![[0.0, 0.0, 0.0, 1.0].into()],
+                            vec![[0.0, 0.0, 0.0, 1.0].into(), 1f32.into()],
                         )
                         .unwrap()
                         .draw_indexed(self.graphics_pipeline.clone(), &DynamicState::none(), vec![self.vertex_buffer.clone()], self.index_buffer.clone(), (self.descriptor_set.clone()), ())
@@ -832,7 +844,7 @@ impl HelloTriangle {
             &self.render_pass,
         );
         self.swap_chain_framebuffers =
-            Self::init_framebuffers(&self.swap_chain_images, &self.render_pass);
+            Self::init_framebuffers(&self.device, self.swap_chain.dimensions(), &self.swap_chain_images, &self.render_pass);
 
         let (uni_buffers, descriptor_set) = Self::init_uniform_buffers(
             self.device.clone(),
