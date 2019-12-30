@@ -7,6 +7,7 @@ extern crate winit;
 use core::borrow::Borrow;
 use std::{collections::HashSet, iter::FromIterator, sync::Arc, time::Instant};
 use std::fs::read;
+use std::path::Path;
 
 use cgmath::{
     Deg,
@@ -17,6 +18,7 @@ use cgmath::{
     Vector3,
 };
 use image::ImageFormat;
+use tobj;
 use vulkano::{
     buffer::{BufferAccess, BufferUsage, CpuAccessibleBuffer, CpuBufferPool, ImmutableBuffer, TypedBufferAccess},
     command_buffer::{AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState},
@@ -46,10 +48,10 @@ use vulkano::{
     },
     sync::{self, GpuFuture, SharingMode},
 };
+use vulkano::format::ClearValue;
 use vulkano::image::AttachmentImage;
 use vulkano_win::VkSurfaceBuild;
 use winit::{dpi::LogicalSize, Event, EventsLoop, Window, WindowBuilder, WindowEvent};
-use vulkano::format::ClearValue;
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -103,28 +105,29 @@ struct UniformBufferObject {
     proj: Matrix4<f32>,
 }
 
-fn vertices() -> [Vertex; 8] {
-    [
-        Vertex::new([-0.5, -0.5, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0]),
-        Vertex::new([0.5, -0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0]),
-        Vertex::new([0.5, 0.5, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0]),
-        Vertex::new([-0.5, 0.5, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0]),
-        Vertex::new([-0.5, -0.5, -0.5], [1.0, 0.0, 0.0], [1.0, 0.0]),
-        Vertex::new([0.5, -0.5, -0.5], [0.0, 1.0, 0.0], [0.0, 0.0]),
-        Vertex::new([0.5, 0.5, -0.5], [0.0, 0.0, 1.0], [0.0, 1.0]),
-        Vertex::new([-0.5, 0.5, -0.5], [1.0, 1.0, 1.0], [1.0, 1.0])
-    ]
-}
-
-fn indices() -> [u16; 12] {
-    [0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4]
-}
+//fn vertices() -> [Vertex; 8] {
+//    [
+//        Vertex::new([-0.5, -0.5, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0]),
+//        Vertex::new([0.5, -0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0]),
+//        Vertex::new([0.5, 0.5, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0]),
+//        Vertex::new([-0.5, 0.5, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0]),
+//        Vertex::new([-0.5, -0.5, -0.5], [1.0, 0.0, 0.0], [1.0, 0.0]),
+//        Vertex::new([0.5, -0.5, -0.5], [0.0, 1.0, 0.0], [0.0, 0.0]),
+//        Vertex::new([0.5, 0.5, -0.5], [0.0, 0.0, 1.0], [0.0, 1.0]),
+//        Vertex::new([-0.5, 0.5, -0.5], [1.0, 1.0, 1.0], [1.0, 1.0])
+//    ]
+//}
+//
+//fn indices() -> [u16; 12] {
+//    [0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4]
+//}
 
 
 struct HelloTriangle {
     events_loop: EventsLoop,
 
-    degrees: f32,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
 
     // Vulkan stuff
 
@@ -141,7 +144,7 @@ struct HelloTriangle {
     graphics_pipeline: Arc<GraphicsPipelineAbstract + Send + Sync>,
     swap_chain_framebuffers: Vec<Arc<FramebufferAbstract + Send + Sync>>,
     vertex_buffer: Arc<BufferAccess + Send + Sync>,
-    index_buffer: Arc<TypedBufferAccess<Content=[u16]> + Send + Sync>,
+    index_buffer: Arc<TypedBufferAccess<Content=[u32]> + Send + Sync>,
     uniform_buffers: CpuBufferPool<UniformBufferObject>,
     descriptor_set: Arc<DescriptorSet + Send + Sync>,
     command_buffers: Vec<Arc<AutoCommandBuffer>>,
@@ -204,13 +207,15 @@ impl Default for HelloTriangle {
 
         let start_time = Instant::now();
 
-        let vertex_buffer = Self::init_vertex_buffer(&graphics_queue);
-        let index_buffer = Self::init_index_buffer(&graphics_queue);
+        let (vertices, indices) = Self::load_model();
+
+        let vertex_buffer = Self::init_vertex_buffer(&vertices, &graphics_queue);
+        let index_buffer = Self::init_index_buffer(&indices, &graphics_queue);
 
         let previous_frame_end = Some(Self::init_sync_objects(&device));
 
         let (texture, tex_future) = {
-            let image = image::load_from_memory_with_format(include_bytes!("/home/mfield/Projects/Rust/vulkan/vertex_buffer/src/test.png"), ImageFormat::PNG).unwrap().to_rgba();
+            let image = image::load_from_memory_with_format(include_bytes!("/home/mfield/Projects/Rust/vulkan/vertex_buffer/src/chalet.jpg"), ImageFormat::JPEG).unwrap().to_rgba();
             let image_data = image.into_raw().clone();
 
 
@@ -243,7 +248,8 @@ impl Default for HelloTriangle {
         let mut app = Self {
             events_loop,
 
-            degrees: 0.0,
+            vertices,
+            indices,
             instance,
             surface,
             swap_chain,
@@ -417,6 +423,7 @@ impl HelloTriangle {
         (events_loop, surface)
     }
 
+
     /*
     To instantiate and choose our physical device we have to do the following.
         1. Filter devices without request features.
@@ -520,17 +527,17 @@ impl HelloTriangle {
         (swap_chain, images)
     }
 
-    fn init_vertex_buffer(graphics_queue: &Arc<Queue>) -> Arc<BufferAccess + Send + Sync> {
+    fn init_vertex_buffer(vertices: &Vec<Vertex>, graphics_queue: &Arc<Queue>) -> Arc<BufferAccess + Send + Sync> {
         let (buffer, future) = ImmutableBuffer::from_iter(
-            vertices().iter().cloned(), BufferUsage::all(), graphics_queue.clone()).unwrap();
+            vertices.iter().cloned(), BufferUsage::all(), graphics_queue.clone()).unwrap();
 
         future.flush().unwrap();
         buffer
     }
 
-    fn init_index_buffer(graphics_queue: &Arc<Queue>) -> Arc<TypedBufferAccess<Content=[u16]> + Send + Sync> {
+    fn init_index_buffer(indices: &Vec<u32>, graphics_queue: &Arc<Queue>) -> Arc<TypedBufferAccess<Content=[u32]> + Send + Sync> {
         let (buffer, future) = ImmutableBuffer::from_iter(
-            indices().iter().cloned(), BufferUsage::all(), graphics_queue.clone()).unwrap();
+            indices.iter().cloned(), BufferUsage::all(), graphics_queue.clone()).unwrap();
 
         future.flush().unwrap();
         buffer
@@ -668,6 +675,47 @@ impl HelloTriangle {
                 ) as Arc<FramebufferAbstract + Send + Sync>
             })
             .collect::<Vec<_>>()
+    }
+
+
+    fn load_model() -> (Vec<Vertex>, Vec<u32>) {
+        let mut indices: Vec<u32> = Vec::new();
+        let mut vertices = Vec::new();
+
+        let my_box = tobj::load_obj(&Path::new("/home/mfield/Projects/Rust/vulkan/vertex_buffer/src/chalet.obj"));
+        let (models, materials) = my_box.unwrap();
+
+        println!("# of models: {}", models.len());
+        println!("# of materials: {}", materials.len());
+        for (i, m) in models.iter().enumerate() {
+            let mesh = &m.mesh;
+            println!("model[{}].name = \'{}\'", i, m.name);
+            println!("model[{}].mesh.material_id = {:?}", i, mesh.material_id);
+
+            println!("Size of model[{}].indices: {}", i, mesh.indices.len());
+            for f in 0..mesh.indices.len() / 3 {
+                indices.push(mesh.indices[3 * f]);
+                indices.push(mesh.indices[3 * f + 1]);
+                indices.push(mesh.indices[3 * f + 2]);
+            }
+
+            // Normals and texture coordinates are also loaded, but not printed in this example
+            println!("model[{}].vertices: {}", i, mesh.positions.len() / 3);
+            println!("model[{}].text_coords_len: {}", i, mesh.texcoords.len() / 2);
+
+            assert!(mesh.positions.len() % 3 == 0);
+            for v in 0..mesh.positions.len() / 3 {
+                vertices.push(Vertex {
+                    pos: [mesh.positions[3 * v], mesh.positions[3 * v + 1], mesh.positions[3 * v + 2]],
+                    color: [1.0, 1.0, 1.1],
+                    texCoord: [mesh.texcoords[2 * v], 1.0 - mesh.texcoords[2 * v + 1]],
+                });
+            }
+
+
+        }
+
+        (vertices, indices)
     }
 
     fn init_command_buffers(&mut self) {

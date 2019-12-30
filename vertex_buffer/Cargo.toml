@@ -4,6 +4,9 @@ version = "0.1.0"
 authors = ["Michael Field <michaecfield97@gmail.com>"]
 edition = "2018"
 
+[profile.release]
+opt-level = 3
+
 [dependencies]
 vulkano = "0.11"
 vulkano-shaders = "0.11"
@@ -11,3 +14,4 @@ vulkano-win = "0.11"
 winit = "0.18"
 cgmath = "0.17.0"
 image = "0.21"
+tobj = "0.1.7"
